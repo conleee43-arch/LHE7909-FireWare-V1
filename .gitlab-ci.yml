@@ -1,0 +1,116 @@
+# CI/CD Pipeline
+# 触发策略：
+#   - main 分支提交      →  编译验证（不打包、不发布）
+#   - tag v*.*.* 推送    → 编译验证通过后自动打包并创建 GitLab Release
+#   - tag debug* 推送    → 跳过编译，快速打包并发布（调试用，固定 tag 名避免累积）
+#   - 自定义 分支        → 手动触发编译验证（省资源）
+
+stages:
+  - build_keil
+  - deploy
+  - release
+  - notify
+
+variables:
+  # 可在这里统一配置版本过滤（留空则编译 V3.6.8 和 V4.0.1 两个版本的所有例程）
+  CI_VERSION_FILTER: ""
+  # 启用 Windows 长路径支持（解决 FreeRTOS 文件名超长问题）
+  GIT_CORE_LONGPATHS: "true"
+  GIT_STRATEGY: clone
+  GIT_DEPTH: 0
+
+#============================================================
+#Stage 2: KEIL 编译（UV4 命令行）
+#============================================================
+keil_build:
+  stage: build_keil
+  tags:
+    - lh32-runner
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^debug/'
+      when: never
+    - if: '$SKIP_BUILD == "true"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_success
+    - if: '$CI_COMMIT_TAG'
+      when: on_success
+    - when: never
+  script:
+    - echo "===== KEIL 编译 ====="
+    - python tools/ci_build.py --compiler keil 
+  artifacts:
+    paths:
+      - tools/keil_build_report.txt
+    when: always
+
+# ============================================================
+# Stage 4: 邮件通知
+# ============================================================
+notify_mail:
+  stage: notify
+  tags:
+    - lh32-runner
+  variables:
+    # 当前流水线仅编译 KEIL；恢复 GCC/IAR 验证时改为 "GCC,KEIL,IAR"
+    COMPILERS: "KEIL"
+  # 注意：不设 dependencies，默认继承全部 stage 的 artifacts
+  # （编译报告 + 发布信息 release_info.txt），main 分支与 tag 流水线都可用
+  # debug tag 也发邮件，但收件人仅限提交者（见 notify.py）
+  rules:
+    - if: '$SKIP_BUILD == "true"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: always
+    - if: '$CI_COMMIT_TAG'
+      when: always
+    - when: never
+  script:
+    - echo "===== 发送通知邮件（编译结果 / 发布结果） ====="
+    - python tools/notify.py
+
+# ============================================================
+# Stage 5: 部署（编译全部通过后，部署例程代码到目标路径）
+# ============================================================
+deploy_release:
+  stage: deploy
+  tags:
+    - lh32-runner
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: on_success
+    - when: never
+  script:
+    - echo "===== 部署例程代码 ====="
+    - python tools/deploy.py
+  artifacts:
+    # 主包 zip + 发布清单 manifest.json（release 阶段据此判断 GUI 是否需上传）
+    paths:
+      - .deploy_output/*.zip
+      - .deploy_output/manifest.json
+    # 过期时间按需调整（发布包建议保留较长）
+    expire_in: 90 days
+
+# ============================================================
+# Stage 6: 发布（zip 上传到包仓库永久保存 + 创建 GitLab Release）
+# ============================================================
+release_job:
+  stage: release
+  tags:
+    - lh32-runner
+  dependencies:
+    - deploy_release
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: on_success
+    - when: never
+  script:
+    - echo "===== 创建 GitLab Release ====="
+    # tag 由 release.py 内部解析：--tag > CI_COMMIT_TAG > RELEASE_TAG > debug
+    - python tools/release.py
+  artifacts:
+    # 发布信息（供 notify 阶段读取，发送发布结果邮件）
+    paths:
+      - .deploy_output/release_info.json
+    when: on_success
+    expire_in: 1 week

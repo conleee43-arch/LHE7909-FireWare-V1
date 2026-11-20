@@ -1,0 +1,135 @@
+# ==========================================================================
+# .gitignore
+# 适用：GD32/STM32 固件 + KEIL/GCC/IAR 多编译器 CI 构建
+# 注意：git 不支持行尾注释，注释必须独占一行
+# ==========================================================================
+
+# ---------------- 通用：备份 / 临时文件 ----------------
+*.bak
+*.bk
+*.tmp
+*.old
+*.orig
+*.rej
+*~
+*.swp
+
+# ---------------- 智能体工具运行目录 ----------------
+.codeartsdoer/
+
+# ---------------- 操作系统 / 编辑器 ----------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# ---------------- Python（tools/ CI 工具） ----------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+
+# ---------------- CI / 打包产物 ----------------
+# ci_build.py 生成的报告
+*_junit.xml
+*_build_report.txt
+# ci_build.py 使用 -o {example}_keil.log 输出的 KEIL 编译日志
+*.keil.log
+# deploy.py / release.py 的本地输出目录
+.deploy_output/
+.deploy_test/
+
+# ---------------- KEIL / MDK-ARM ----------------
+# 编译输出（UV4 工程 OutputDirectory=.\ 或 .\debug，产物直接落在 KEIL/ 目录）
+*.o
+*.d
+*.crf
+*.axf
+*.map
+*.lnp
+*.htm
+*.lst
+*.dep
+*.iex
+*.sct
+*.i
+*.plg
+# GUI 布局（含用户名/机器名），易冲突，不提交
+*.uvguix.*
+# EventRecorder 等组件生成的设备描述文件
+*.scvd
+*.log
+debug.log
+*_sct.Bak
+*_Bak.htm
+# RTE Pack 更新时生成的备份（如 RTE_Device.h.0000）
+*.0000
+# RTE Pack 隐藏缓存文件（如 .gd32f3x0_misc.c@2.0.0）
+**/RTE/**/.*@*
+# RTE 自动生成文件（RTE/Device/ 下的 .c/.h/.s 库文件仍会保留，便于克隆后直接编译）
+**/RTE/RTE_Components.h
+**/RTE/_Target_*/
+# Keil 按 Target 名生成的 RTE 目录（LHE7908 为派生项目名 / LHE7909 为当前 Target 名）
+**/RTE/_LHE7908_*/
+**/RTE/_LHE7909_*/
+
+# J-Link / 调试会话（含本机绝对路径，勿提交/勿打包；JLinkSettings.ini 为调试器设置，
+# 已在 deploy.py 的 EXCLUDE_FILES 中同步排除，保证发布包中不出现）
+JLinkLog.txt
+JLinkSettings.ini
+
+# KEIL 输出目录下生成的固件镜像（如需把固件作为交付物，请用 git add -f 或 ! 规则放行）
+**/KEIL/*.hex
+**/KEIL/*.bin
+
+# 上位机 GUI 打包产物（本地生成后提交，供发布打包；含 _internal/ 运行时文件）
+gui/build/
+# 注意：dist 内文件的例外规则见文件末尾（须位于 **/Debug/ 等规则之后）
+
+# ---------------- GCC ----------------
+**/GCC/Output/
+
+# ---------------- IAR ----------------
+**/IAR8/Debug/
+**/IAR8/Release/
+**/IAR8/settings/
+# IAR 调试器配置，用户特定
+*.ewd
+
+# ---------------- 通用编译输出目录 ----------------
+**/Objects/
+**/Listings/
+**/settings/
+/**/debug/**
+**/Debug/
+
+# ------------------ GUI ----------------
+/.vscode/*
+datalog.txt
+*.spec
+
+# ===== PyInstaller dist 例外（必须位于 **/Debug/、*.py[cod]、__pycache__/ 等规则之后）=====
+# gui/dist 或 gui/src/dist 均为 PyInstaller 产物目录，本地生成后整目录入库，供 CI 打包发布。
+# 用 **/dist/** 通配，避免换项目时目录层级不同（gui/dist、gui/src/dist…）导致例外规则失效。
+# 下列内容会被上方规则误伤，缺任一都可能导致发布 exe 运行报错：
+#  - *.pyd（Python 扩展 DLL，如 _socket.pyd/_ssl.pyd/QtCore.pyd）被 *.py[cod] 误伤
+#  - torch/distributed/debug 等第三方库自带的 debug 目录被 **/Debug/ 误伤
+#  - 产物内残留的 __pycache__ 被 __pycache__/ 误伤
+# 注意：反忽略必须以 ! 开头；目录级排除（__pycache__/）须先反忽略目录再反忽略内容
+!**/dist/**/*.pyd
+!**/dist/**/debug/
+!**/dist/**/debug/**
+!**/dist/**/Debug/
+!**/dist/**/Debug/**
+!**/dist/**/__pycache__/
+!**/dist/**/__pycache__/**
+
+# ===== PyInstaller 打包配置必须入库（上面的 *.spec 只用于忽略临时 spec）=====
+!GUI/LHE7909_ECG_Studio.spec
+!GUI/LHE7909_ECG_Studio_OneFile.spec
