@@ -126,11 +126,11 @@ void LHE7909_init(uint8_t DR)
 	 ch7_gain=6;
 	 ch8_gain=1;
 	
-	LHE7909_write_register(RLD_SENSP_ADDRESS,0x01);//BIAS_SENSP=0x01，仅将 CH1 P 端接入偏置环路（CH8 不参与计算）
-	LHE7909_check_reg(RLD_SENSP_ADDRESS, 0x01, "RLD_SENSP_ADDRESS");
+	LHE7909_write_register(RLD_SENSP_ADDRESS,0x00);//RLD_SENSP=0x00，断开 CH1~CH8 P 端偏置求和选择
+	LHE7909_check_reg(RLD_SENSP_ADDRESS, 0x00, "RLD_SENSP_ADDRESS");
 	
-	LHE7909_write_register(RLD_SENSN_ADDRESS,0x01);//BIAS_SENSN=0x01，仅将 CH1 N 端接入偏置环路（CH8 不参与计算）
-	LHE7909_check_reg(RLD_SENSN_ADDRESS, 0x01, "RLD_SENSN_ADDRESS");
+	LHE7909_write_register(RLD_SENSN_ADDRESS,0x00);//RLD_SENSN=0x00，断开 CH1~CH8 N 端偏置求和选择
+	LHE7909_check_reg(RLD_SENSN_ADDRESS, 0x00, "RLD_SENSN_ADDRESS");
 
 
 	LHE7909_write_register(LOFF_SENSP_ADDRESS,0x00);//关闭 IN1P~IN8P 导联脱落检测（未启用激励电流）
@@ -404,6 +404,38 @@ static int32_t LHE7909_sign_extend_24bit(uint8_t b2, uint8_t b1, uint8_t b0)
 extern uint8_t LHE7909_adc_data[27];
 int32_t ch1_hex,ch2_hex,ch3_hex,ch4_hex,ch5_hex,ch6_hex,ch7_hex,ch8_hex;
 float   ch1_voltage,ch2_voltage,ch3_voltage,ch4_voltage,ch5_voltage,ch6_voltage,ch7_voltage,ch8_voltage;
+
+/* ===== BIAS_AMP 闭环 A/B/A′ 对比测试：DRDY 中断侧（命令侧实现见文末 BIAS 测试模块） =====
+ * 测试模式下中断不再逐帧 printf（每帧约 450µs，必丢点，且会与定长采集/CSV 输出混杂）；
+ * 采集请求有效时把 CH1/CH8 原始码存入下面的静态缓冲，采满置位后由主循环统一输出。 */
+#if (ECG_UART_BIN_MODE == 0)
+volatile uint8_t  g_bias_test_active = 0;            /* 1=已进入 BIAS 测试模式（DRDY 中断静默） */
+static volatile uint8_t  bias_capture_request = 0;   /* 主循环→中断：开始定长采集 */
+static volatile uint8_t  bias_capture_done = 0;      /* 中断→主循环：本次采集已结束 */
+static volatile uint16_t bias_capture_count = 0;     /* 已存入缓冲的样本数 */
+static volatile uint32_t bias_last_sample_tick = 0;  /* 最近一个样本的时刻（停滞超时用） */
+static int32_t bias_ch1_buf[BIAS_TEST_N_POINTS];     /* CH1 原始码缓冲（2000 点） */
+static int32_t bias_ch8_buf[BIAS_TEST_N_POINTS];     /* CH8 原始码缓冲（2000 点） */
+
+/* DRDY 中断上下文调用：只做拷贝与计数，绝不 printf。采满 2000 点置 bias_capture_done，
+ * 由主循环 LHE7909_bias_task() 检测并输出 CSV。 */
+static void LHE7909_bias_capture_store_isr(void)
+{
+	if ((bias_capture_request != 0U) && (bias_capture_count < BIAS_TEST_N_POINTS))
+	{
+		bias_ch1_buf[bias_capture_count] = ch1_hex;
+		bias_ch8_buf[bias_capture_count] = ch8_hex;
+		bias_capture_count++;
+		bias_last_sample_tick = HAL_GetTick();
+		if (bias_capture_count >= BIAS_TEST_N_POINTS)
+		{
+			bias_capture_request = 0U;
+			bias_capture_done = 1U;
+		}
+	}
+}
+#endif /* (ECG_UART_BIN_MODE == 0) */
+
 void LHE7909_get_adc_data(void)
 {
 
@@ -442,16 +474,26 @@ void LHE7909_get_adc_data(void)
 			/* 状态字前 3 字节(原始 hex)紧随数据帧上传，上位机解析导联脱落状态 */
 			LHE7909_send_loff_status();
 #else
-		 /* 调试输出：CH1~CH8 按顺序输出电压(mV，未除 PGA 增益)及 24 位原始采集码(0xXXXXXX) */
-		 printf("CH1:%.3f(0x%06lX),CH2:%.3f(0x%06lX),CH3:%.3f(0x%06lX),CH4:%.3f(0x%06lX),CH5:%.3f(0x%06lX),CH6:%.3f(0x%06lX),CH7:%.3f(0x%06lX),CH8:%.3f(0x%06lX)\r\n",
-		        ch1_voltage, (unsigned long)((uint32_t)ch1_hex & 0x00FFFFFFUL),
-		        ch2_voltage, (unsigned long)((uint32_t)ch2_hex & 0x00FFFFFFUL),
-		        ch3_voltage, (unsigned long)((uint32_t)ch3_hex & 0x00FFFFFFUL),
-		        ch4_voltage, (unsigned long)((uint32_t)ch4_hex & 0x00FFFFFFUL),
-		        ch5_voltage, (unsigned long)((uint32_t)ch5_hex & 0x00FFFFFFUL),
-		        ch6_voltage, (unsigned long)((uint32_t)ch6_hex & 0x00FFFFFFUL),
-		        ch7_voltage, (unsigned long)((uint32_t)ch7_hex & 0x00FFFFFFUL),
-		        ch8_voltage, (unsigned long)((uint32_t)ch8_hex & 0x00FFFFFFUL));
+		 /* BIAS 测试模式：不做逐帧调试打印（避免与定长采集/CSV 输出混杂并丢点）；
+		  * 采集请求有效时把 CH1/CH8 原始码存入静态缓冲，其余样本静默丢弃 */
+		 if (g_bias_test_active)
+		 {
+			 LHE7909_bias_capture_store_isr();
+		 }
+		 else
+		 {
+			 /* 调试输出：CH1~CH8 按顺序输出电压(mV，已除 PGA 增益，折算到输入端)
+			  * 及 24 位原始采集码(0xXXXXXX) */
+			 printf("CH1:%.3f(0x%06lX),CH2:%.3f(0x%06lX),CH3:%.3f(0x%06lX),CH4:%.3f(0x%06lX),CH5:%.3f(0x%06lX),CH6:%.3f(0x%06lX),CH7:%.3f(0x%06lX),CH8:%.3f(0x%06lX)\r\n",
+			        ch1_voltage, (unsigned long)((uint32_t)ch1_hex & 0x00FFFFFFUL),
+			        ch2_voltage, (unsigned long)((uint32_t)ch2_hex & 0x00FFFFFFUL),
+			        ch3_voltage, (unsigned long)((uint32_t)ch3_hex & 0x00FFFFFFUL),
+			        ch4_voltage, (unsigned long)((uint32_t)ch4_hex & 0x00FFFFFFUL),
+			        ch5_voltage, (unsigned long)((uint32_t)ch5_hex & 0x00FFFFFFUL),
+			        ch6_voltage, (unsigned long)((uint32_t)ch6_hex & 0x00FFFFFFUL),
+			        ch7_voltage, (unsigned long)((uint32_t)ch7_hex & 0x00FFFFFFUL),
+			        ch8_voltage, (unsigned long)((uint32_t)ch8_hex & 0x00FFFFFFUL));
+		 }
 #endif
 		 #endif
 		// printf("%.3f\r\n",ch1_voltage);
@@ -487,8 +529,13 @@ void LHE7909_get_adc_data(void)
 float  ADC_DataToMiniVolt(int32_t data,uint8_t gain)
 {
 	float mv;
-	  //mv = data*2.0*VrefVolt/((1<<24))/gain;
-	mv = data*2.0*VrefVolt/((1<<24));
+	if (gain == 0U)
+	{
+		gain = 1U;   /* 增益档 0x80(掉电)对应的 0 值按 1 处理，避免除 0 */
+	}
+	/* 修正：mV 必须除以 PGA 增益折算到输入端（此前未除，输出的是 ADC 输出端电压）。
+	 * gain 由各通道的 chX_gain 传入，与各自 CHnSET 配置保持一致，不写死。 */
+	mv = data*2.0*VrefVolt/((1<<24))/gain;
 	return mv;
 }
 
@@ -779,6 +826,336 @@ void LHE7909_write_reg_cmd(uint8_t addr, uint8_t value)
 #endif
 }
 
+/* ====================================================================
+ * BIAS_AMP 闭环 A/B/A′ 对比测试模块（仅文本调试模式 ECG_UART_BIN_MODE=0 编译）
+ * ====================================================================
+ * 目的：验证 LHE7909 片内 BIAS_AMP 闭环对共模干扰的抑制能力。
+ *   A  组 CONFIG3=0x98（PD_BIAS=0，BIAS_AMP 掉电）
+ *   B  组 CONFIG3=0x9C（PD_BIAS=1，BIAS_AMP 使能）
+ *   A′ 组 CONFIG3=0x98（切回 A 复测，寄存器值与 A 相同，仅 CSV 头标注 A2）
+ * 公共配置（宏定义见 LHE7909.h BIAS_TEST_*）：CONFIG1=0x55(500SPS)、CONFIG2=0xD3、
+ *   LOFF=0x03、CH1SET=0x60(增益12,正常输入)、CH8SET=0x12(增益1,偏置回读MUX=010)、
+ *   BIAS_SENSP=0x01、BIAS_SENSN=0x01；CONFIG3 是唯一变量。
+ * 硬件侧（由测试者搭建，固件不参与）：信号源向共模节点 Node_CM 注入
+ *   50Hz/1Vpp/+2.5V 偏置，IN1P 支路串 51kΩ 制造电极不平衡，示波器监测 Node_CM。
+ * 命令（帧格式沿用上位机协议 [0xAA][0xCC][cmd][data][sum]{0x0D}）：
+ *   0x10 ENTER / 0x11 GROUP / 0x12 ACQ / 0x13 EXIT，见 LHE7909.h。
+ * 采集：DRDY 中断只把 CH1/CH8 原始码存入静态缓冲（中断内 printf 每帧约 450µs，
+ *   必丢点），采满 2000 点(500SPS 下 4 秒)后由主循环 LHE7909_bias_task() 输出 CSV。 */
+
+#if (ECG_UART_BIN_MODE == 0)
+static uint8_t  bias_group = 0;              /* 当前组 0=A 1=B 2=A′（采集输出标注用） */
+static uint8_t  bias_capture_gain = 12;      /* 本次采集的 CH1 增益（ACQ 时锁定，mV 换算与 CSV 头 GAIN= 用） */
+static volatile uint32_t bias_settle_until_tick = 0;  /* 切组后丢弃窗口截止时刻(2s 内禁止采集) */
+
+/* 文本模式命令接收：直接轮询 USART2 RXNE 并读 RDR 取 1 字节（最多等 1ms）。
+ * 绕开 HAL_UART_Receive 的原因：该函数全程持有 HAL 全局锁(huart->Lock)，会把
+ * DRDY 中断里的 printf(HAL_UART_Transmit) 全部挤成 HAL_BUSY 丢字节；直读寄存器
+ * 不经过 HAL 锁，且 RX FIFO(16 字节已使能)可缓冲中断发送窗口内到达的命令字节。 */
+static uint8_t LHE7909_uart_rx_byte(uint8_t *out)
+{
+	uint32_t start = HAL_GetTick();
+
+	while ((HAL_GetTick() - start) < 1U)
+	{
+		uint32_t isr_flags = READ_REG(huart2.Instance->ISR);
+		if ((isr_flags & USART_ISR_RXNE_RXFNE) != 0U)
+		{
+			if ((isr_flags & USART_ISR_ORE) != 0U)
+			{
+				/* 清 RX 溢出标志（被挤掉的命令字节按丢失处理，后续帧重新同步） */
+				WRITE_REG(huart2.Instance->ICR, USART_ICR_ORECF);
+			}
+			*out = (uint8_t)(READ_REG(huart2.Instance->RDR) & 0xFFU);
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* 组号 → 输出标注：A′ 与 A 的寄存器值相同，仅 CSV 头标注不同 */
+static const char *LHE7909_bias_group_label(uint8_t group)
+{
+	static const char *const label[3] = {"A", "B", "A2"};
+	return label[(group <= 2U) ? group : 0U];
+}
+
+/* 组号 → CONFIG3 期望值：A/A′=0x98(PD_BIAS 掉电)，B=0x9C(PD_BIAS 使能) */
+static uint8_t LHE7909_bias_group_cfg3(uint8_t group)
+{
+	return (group == 1U) ? BIAS_TEST_CFG3_B : BIAS_TEST_CFG3_A;
+}
+
+static uint8_t LHE7909_bias_capture_busy(void)
+{
+	return (uint8_t)((bias_capture_request != 0U) || (bias_capture_done != 0U));
+}
+
+/* 打印 BIAS 测试配置转储（必须在 SDATAC 窗口内调用，回读才可靠） */
+static void LHE7909_bias_config_dump(void)
+{
+	printf("---- BIAS TEST CONFIG DUMP ----\r\n");
+	printf("CONFIG1=0x%02X\r\n", LHE7909_read_register(CONFIG1_ADDRESS));
+	printf("CONFIG2=0x%02X\r\n", LHE7909_read_register(CONFIG2_ADDRESS));
+	printf("CONFIG3=0x%02X\r\n", LHE7909_read_register(CONFIG3_ADDRESS));
+	printf("LOFF=0x%02X\r\n", LHE7909_read_register(LOFF_ADDRESS));
+	printf("CH1SET=0x%02X\r\n", LHE7909_read_register(CH1SET_ADDRESS));
+	printf("CH8SET=0x%02X\r\n", LHE7909_read_register(CH8SET_ADDRESS));
+	printf("BIAS_SENSP=0x%02X\r\n", LHE7909_read_register(BIAS_SENSP_ADDRESS));
+	printf("BIAS_SENSN=0x%02X\r\n", LHE7909_read_register(BIAS_SENSN_ADDRESS));
+	printf("-------------------------------\r\n");
+}
+
+/* 进入 BIAS 测试模式（命令 0x10）：应用公共配置 + 切 A 组 + 配置转储。
+ * 所有寄存器写入都在关中断窗口内完成（双重 SDATAC 后 SPI 独占，DRDY 不并发），
+ * 每个寄存器写后用 LHE7909_check_reg() 回读校验（不一致打印 MISMATCH 报错），
+ * START 前打印一份配置转储。启动转换后丢弃 2 秒数据才允许采集。 */
+static void LHE7909_bias_enter(void)
+{
+	printf("BIAS TEST ENTER: applying common config...\r\n");
+
+	__disable_irq();
+
+	/* ① 双重 SDATAC：退出连续读模式（沿用现有代码习惯），寄存器读写才可靠 */
+	LHE7909_SDATAC();
+	LHE7909_SDATAC();
+
+	/* ② 公共配置（CONFIG3 之外的固定项），逐个写 + 回读校验 */
+	LHE7909_write_register(CONFIG1_ADDRESS, BIAS_TEST_CFG1);
+	LHE7909_check_reg(CONFIG1_ADDRESS, BIAS_TEST_CFG1, "CONFIG1(BIAS)");
+	LHE7909_write_register(CONFIG2_ADDRESS, BIAS_TEST_CFG2);
+	LHE7909_check_reg(CONFIG2_ADDRESS, BIAS_TEST_CFG2, "CONFIG2(BIAS)");
+	LHE7909_write_register(LOFF_ADDRESS, BIAS_TEST_LOFF);
+	LHE7909_check_reg(LOFF_ADDRESS, BIAS_TEST_LOFF, "LOFF(BIAS)");
+	LHE7909_write_register(CH1SET_ADDRESS, BIAS_TEST_CH1SET);
+	LHE7909_check_reg(CH1SET_ADDRESS, BIAS_TEST_CH1SET, "CH1SET(BIAS)");
+	LHE7909_write_register(CH8SET_ADDRESS, BIAS_TEST_CH8SET);
+	LHE7909_check_reg(CH8SET_ADDRESS, BIAS_TEST_CH8SET, "CH8SET(BIAS)");
+	LHE7909_write_register(BIAS_SENSP_ADDRESS, BIAS_TEST_BIASSENSP);
+	LHE7909_check_reg(BIAS_SENSP_ADDRESS, BIAS_TEST_BIASSENSP, "BIAS_SENSP(BIAS)");
+	LHE7909_write_register(BIAS_SENSN_ADDRESS, BIAS_TEST_BIASSENSN);
+	LHE7909_check_reg(BIAS_SENSN_ADDRESS, BIAS_TEST_BIASSENSN, "BIAS_SENSN(BIAS)");
+
+	/* ③ 增益变量随 CHnSET 同步（ADC_DataToMiniVolt 按各自增益折算到输入端）；
+	 * CH2~CH7 本测试不改写，仍保持上电初始化的 0x01(增益6,内部短接) */
+	ch1_gain = BIAS_TEST_CH1_GAIN;   /* CH1SET=0x60 → 12 */
+	ch8_gain = 1U;                   /* CH8SET=0x12 → 1 */
+
+	/* ④ 切 A 组：CONFIG3=0x98（PD_BIAS 掉电）——本测试唯一变量 */
+	LHE7909_write_register(CONFIG3_ADDRESS, BIAS_TEST_CFG3_A);
+	LHE7909_check_reg(CONFIG3_ADDRESS, BIAS_TEST_CFG3_A, "CONFIG3(BIAS)");
+	bias_group = 0U;
+
+	/* ⑤ 清残留采集状态 + 配置转储（仍在 SDATAC 窗口内，回读可靠） */
+	bias_capture_request = 0U;
+	bias_capture_done = 0U;
+	bias_capture_count = 0U;
+	LHE7909_bias_config_dump();
+
+	/* ⑥ 重新启动转换：沿用现有代码的启动方式（START 命令，不能进 RDATAC——
+	 *    本固件采集中断用 RDATA 单次读取数，进连续读模式会取数冲突） */
+	LHE7909_START();
+	LHE7909_delay_us(20);
+
+	__enable_irq();
+
+	/* ⑦ 置测试模式标志 → DRDY 中断停止逐帧打印；丢弃切换后 2 秒内的数据
+	 *    （环路与数字滤波器稳定），期间样本静默丢弃，之后才允许 ACQ */
+	g_bias_test_active = 1U;
+	bias_settle_until_tick = HAL_GetTick() + BIAS_TEST_SETTLE_MS;
+	printf("BIAS TEST ENTER: GROUP A settling %u ms (data discarded)...\r\n",
+	       (unsigned)BIAS_TEST_SETTLE_MS);
+	HAL_Delay(BIAS_TEST_SETTLE_MS);
+	printf("BIAS TEST ENTER OK: GROUP A (CONFIG3=0x98) ready, CH1 GAIN=%u\r\n",
+	       (unsigned)ch1_gain);
+}
+
+/* 切换测试分组（命令 0x11，data=0x00:A 0x01:B 0x02:A′）。严格按序：
+ * 关中断窗口内 发 SDATAC 退出连续读模式 → 写 CONFIG3 → LHE7909_check_reg()
+ * 回读校验（不一致打印 MISMATCH 报错，只报告不改流程）→ START 重新启动转换
+ * （沿用现有代码的启动方式）→ 丢弃切换后 2 秒内的数据（环路与数字滤波器稳定）
+ * → 才允许采集（LHE7909_bias_acq_start() 的 settle 窗口检查兜底）。 */
+static void LHE7909_bias_switch_group(uint8_t group)
+{
+	uint8_t cfg3 = LHE7909_bias_group_cfg3(group);
+
+	__disable_irq();
+	LHE7909_SDATAC();
+	LHE7909_SDATAC();
+	LHE7909_write_register(CONFIG3_ADDRESS, cfg3);
+	LHE7909_check_reg(CONFIG3_ADDRESS, cfg3, "CONFIG3(BIAS)");
+	LHE7909_START();
+	LHE7909_delay_us(20);
+	__enable_irq();
+
+	/* 后续采集输出的 GROUP 标注与 CONFIG3 回显按本组 */
+	bias_group = group;
+	bias_settle_until_tick = HAL_GetTick() + BIAS_TEST_SETTLE_MS;
+	printf("BIAS GROUP %s: settling %u ms (data discarded)...\r\n",
+	       LHE7909_bias_group_label(group), (unsigned)BIAS_TEST_SETTLE_MS);
+	HAL_Delay(BIAS_TEST_SETTLE_MS);
+	printf("BIAS GROUP %s OK: CONFIG3=0x%02X, ready for ACQ\r\n",
+	       LHE7909_bias_group_label(group), cfg3);
+}
+
+/* 触发一次定长采集（命令 0x12）：DRDY 中断把 CH1/CH8 原始码写入静态缓冲，
+ * 采满 2000 点（500SPS 下 4 秒）后由主循环 LHE7909_bias_task() 统一输出 CSV。 */
+static void LHE7909_bias_acq_start(void)
+{
+	uint32_t now = HAL_GetTick();
+	const char *label = LHE7909_bias_group_label(bias_group);
+
+	if (LHE7909_bias_capture_busy())
+	{
+		printf("BIAS ACQ BUSY: previous capture running, wait for #END\r\n");
+		return;
+	}
+	/* 切组后 2 秒丢弃窗口未过不允许采集（切组命令自身已等 2 秒，此为兜底） */
+	if ((int32_t)(now - bias_settle_until_tick) < 0)
+	{
+		printf("BIAS ACQ FAIL: %u ms settle window after group switch not elapsed\r\n",
+		       (unsigned)BIAS_TEST_SETTLE_MS);
+		return;
+	}
+
+	/* 锁定本次采集的 CH1 增益（12）：CSV 头 GAIN= 与 mV 换算都用它 */
+	bias_capture_gain = ch1_gain;
+
+	__disable_irq();
+	bias_capture_count = 0U;
+	bias_capture_done = 0U;
+	bias_last_sample_tick = now;
+	bias_capture_request = 1U;   /* ISR 从下一个 DRDY 开始存点 */
+	__enable_irq();
+
+	printf("BIAS ACQ START: GROUP %s, %u points @%uSPS (~%u s), GAIN=%u\r\n",
+	       label, (unsigned)BIAS_TEST_N_POINTS, (unsigned)BIAS_TEST_FS_SPS,
+	       (unsigned)(BIAS_TEST_N_POINTS / BIAS_TEST_FS_SPS), (unsigned)bias_capture_gain);
+}
+
+/* 输出一次定长采集结果（主循环上下文，DRDY 中断只存缓冲不打印）：
+ * 起始行  #GROUP,<A|B|A2>,CONFIG3=0x98|0x9C,N=2000,FS=500,GAIN=12
+ * 数据行  序号,CH1原始码(有符号十进制),CH1电压mV,CH8原始码(有符号十进制)  ×每样本一行
+ * 结束行  #END,<实际点数>（实际点数 ≠ 2000 时先打印 #WARN 警告，如实报告） */
+static void LHE7909_bias_print_capture(void)
+{
+	uint16_t n = bias_capture_count;
+	uint16_t i;
+	const char *label = LHE7909_bias_group_label(bias_group);
+	uint8_t cfg3 = LHE7909_bias_group_cfg3(bias_group);
+
+	printf("#GROUP,%s,CONFIG3=0x%02X,N=%u,FS=%u,GAIN=%u\r\n",
+	       label, cfg3, (unsigned)BIAS_TEST_N_POINTS, (unsigned)BIAS_TEST_FS_SPS,
+	       (unsigned)bias_capture_gain);
+
+	for (i = 0U; i < n; i++)
+	{
+		float mv = ADC_DataToMiniVolt(bias_ch1_buf[i], bias_capture_gain);
+		printf("%u,%ld,%.3f,%ld\r\n",
+		       (unsigned)(i + 1U), (long)bias_ch1_buf[i], mv, (long)bias_ch8_buf[i]);
+	}
+
+	if (n != BIAS_TEST_N_POINTS)
+	{
+		printf("#WARN: expected %u points, got %u (DRDY stall?)\r\n",
+		       (unsigned)BIAS_TEST_N_POINTS, (unsigned)n);
+	}
+	printf("#END,%u\r\n", (unsigned)n);
+}
+
+/* 退出 BIAS 测试模式（命令 0x13）：恢复进入前的初始化配置。
+ * 恢复值与 LHE7909_init() 完全一致（若 init 调整配置请同步修改此处）：
+ * CONFIG1=0x55、CONFIG2=0xD3、CONFIG3=0x9C、LOFF=0x03、CH1SET=0x10、
+ * CH2SET~CH7SET=0x01、CH8SET=0x12、RLD_SENSP/N(=BIAS_SENSP/N)=0x00，
+ * 增益变量同步恢复，VrefVolt 恢复 2400mV。逐寄存器写 + 回读校验。 */
+static void LHE7909_bias_exit(void)
+{
+	uint16_t aborted = 0;
+
+	__disable_irq();
+	if (bias_capture_request != 0U)
+	{
+		/* 采集中退出：中止本次采集，不输出 */
+		aborted = bias_capture_count;
+		bias_capture_request = 0U;
+		bias_capture_done = 0U;
+		bias_capture_count = 0U;
+	}
+	/* 已完成待输出的采集(done=1)不清理：主循环同一轮内 bias_task 随后照常输出 */
+	g_bias_test_active = 0U;
+
+	LHE7909_SDATAC();
+	LHE7909_SDATAC();
+
+	/* ---- 以下恢复值与 LHE7909_init() 保持一致 ---- */
+	LHE7909_write_register(CONFIG1_ADDRESS, 0x55);
+	LHE7909_check_reg(CONFIG1_ADDRESS, 0x55, "CONFIG1(RESTORE)");
+	LHE7909_write_register(CONFIG2_ADDRESS, 0xD3);
+	LHE7909_check_reg(CONFIG2_ADDRESS, 0xD3, "CONFIG2(RESTORE)");
+	LHE7909_write_register(CONFIG3_ADDRESS, 0x9C);
+	LHE7909_check_reg(CONFIG3_ADDRESS, 0x9C, "CONFIG3(RESTORE)");
+	LHE7909_write_register(LOFF_ADDRESS, 0x03);
+	LHE7909_check_reg(LOFF_ADDRESS, 0x03, "LOFF(RESTORE)");
+	LHE7909_write_register(CH1SET_ADDRESS, 0x10);
+	LHE7909_check_reg(CH1SET_ADDRESS, 0x10, "CH1SET(RESTORE)");
+	LHE7909_write_register(CH2SET_ADDRESS, 0x01);
+	LHE7909_write_register(CH3SET_ADDRESS, 0x01);
+	LHE7909_write_register(CH4SET_ADDRESS, 0x01);
+	LHE7909_write_register(CH5SET_ADDRESS, 0x01);
+	LHE7909_write_register(CH6SET_ADDRESS, 0x01);
+	LHE7909_write_register(CH7SET_ADDRESS, 0x01);
+	LHE7909_write_register(CH8SET_ADDRESS, 0x12);
+	LHE7909_check_reg(CH8SET_ADDRESS, 0x12, "CH8SET(RESTORE)");
+	LHE7909_write_register(RLD_SENSP_ADDRESS, 0x00);
+	LHE7909_check_reg(RLD_SENSP_ADDRESS, 0x00, "RLD_SENSP(RESTORE)");
+	LHE7909_write_register(RLD_SENSN_ADDRESS, 0x00);
+	LHE7909_check_reg(RLD_SENSN_ADDRESS, 0x00, "RLD_SENSN(RESTORE)");
+
+	/* 增益变量随 CHnSET 恢复（与 LHE7909_init 一致） */
+	ch1_gain = 1U;
+	ch2_gain = 6U;
+	ch3_gain = 6U;
+	ch4_gain = 6U;
+	ch5_gain = 6U;
+	ch6_gain = 6U;
+	ch7_gain = 6U;
+	ch8_gain = 1U;
+	VrefVolt = 2400.0;
+
+	LHE7909_START();
+	LHE7909_delay_us(20);
+	__enable_irq();
+
+	if (aborted != 0U)
+	{
+		printf("BIAS EXIT: capture aborted (%u/%u points discarded)\r\n",
+		       (unsigned)aborted, (unsigned)BIAS_TEST_N_POINTS);
+	}
+	printf("BIAS EXIT OK: init config restored\r\n");
+}
+
+/* BIAS 测试任务（主循环周期调用，仅文本模式）：
+ * 1) 采集中停滞超时监测：DRDY 停止等异常导致 BIAS_TEST_STALL_MS 内无新样本时
+ *    结束本次采集，按实际点数输出并告警；
+ * 2) 采集完成后输出定长采集 CSV（起始行/数据行/结束行）。 */
+void LHE7909_bias_task(void)
+{
+	if (bias_capture_request != 0U)
+	{
+		if ((HAL_GetTick() - bias_last_sample_tick) > BIAS_TEST_STALL_MS)
+		{
+			bias_capture_request = 0U;
+			bias_capture_done = 1U;
+		}
+	}
+	if (bias_capture_done != 0U)
+	{
+		bias_capture_done = 0U;
+		LHE7909_bias_print_capture();
+	}
+}
+#endif /* (ECG_UART_BIN_MODE == 0) */
+
 /* 外部 UART 句柄（定义于 main.c，本文件 LHE7909_send_frame 之前已声明） */
 
 /* 解析上位机命令帧（主循环轮询调用）：
@@ -787,9 +1164,12 @@ void LHE7909_write_reg_cmd(uint8_t addr, uint8_t value)
  * 成功处理返回 1，无命令/校验失败返回 0 */
 uint8_t LHE7909_process_command(void)
 {
+#if ECG_UART_BIN_MODE
 	uint8_t rx[ECG_CMD_LEN],i;
 	uint16_t timeout = 10;
 	uint8_t gain;
+
+	/* ============ 二进制模式：原有上位机命令（行为不变） ============ */
 
 	/* 轮询接收 1 字节，直到凑满 ECG_CMD_LEN 或超时 */
 	while (timeout > 0)
@@ -1196,6 +1576,133 @@ uint8_t LHE7909_process_command(void)
 	}
 
 	return 0;
+
+#else
+	/* ============ 文本调试模式：BIAS_AMP 闭环 A/B/A′ 对比测试命令 ============
+	 * 帧格式沿用现有上位机协议: [0xAA][0xCC][cmd][data][sum]{0x0D}，
+	 * sum = 前 4 字节累加和的低 8 位。
+	 * 接收实现与二进制模式不同：直接轮询 USART2 的 RXNE/RDR 取字节（RX FIFO
+	 * 16 字节已使能），不调用 HAL_UART_Receive —— 它全程持有 HAL 全局锁，
+	 * 会把 DRDY 中断里的 printf(HAL_UART_Transmit) 全部挤成 HAL_BUSY 丢字节；
+	 * 直读寄存器不经过 HAL 锁，主循环轮询与中断发送即可安全并发
+	 * （这也是此前文本模式不调用本函数的原因）。 */
+	{
+		uint8_t rx[ECG_CMD_LEN];
+		uint16_t timeout = 10;
+		uint8_t got_head = 0;
+		uint8_t i;
+
+		/* 轮询等待帧头：总窗口约 10ms，无命令即返回主循环 */
+		while (timeout > 0)
+		{
+			if (!LHE7909_uart_rx_byte(&rx[0]))
+			{
+				timeout--;
+				continue;
+			}
+			if (rx[0] != ECG_CMD_HEAD1)
+			{
+				continue;   /* 等待帧头 */
+			}
+			got_head = 1;
+			break;
+		}
+		if (!got_head)
+		{
+			return 0;   /* 无命令 */
+		}
+
+		/* 已收到帧头，继续接收剩余 5 字节（每字节最多等 20ms，节奏与原框架一致） */
+		for (i = 1; i < ECG_CMD_LEN; i++)
+		{
+			uint16_t byte_timeout = 20;
+			while ((byte_timeout > 0) && (!LHE7909_uart_rx_byte(&rx[i])))
+			{
+				byte_timeout--;
+			}
+			if (byte_timeout == 0)
+			{
+				return 0;
+			}
+		}
+
+		/* 校验帧头2 */
+		if (rx[1] != ECG_CMD_HEAD2_PC2MCU)
+		{
+			return 0;
+		}
+
+		/* 普通命令校验和 = 前 4 字节累加和的低 8 位（与原框架一致） */
+		{
+			uint8_t calc = (uint8_t)(rx[0] + rx[1] + rx[2] + rx[3]);
+			if (calc != rx[4])
+			{
+				return 0;
+			}
+		}
+
+		switch (rx[2])
+		{
+			case ECG_CMD_BIAS_ENTER:          /* 进入测试模式：公共配置+切A组+转储 */
+				if (g_bias_test_active)
+				{
+					printf("BIAS ENTER FAIL: already in test mode (send EXIT first)\r\n");
+				}
+				else
+				{
+					LHE7909_bias_enter();
+				}
+				return 1;
+
+			case ECG_CMD_BIAS_GROUP:          /* 切组: 0x00=A 0x01=B 0x02=A'(复测) */
+				if (!g_bias_test_active)
+				{
+					printf("BIAS GROUP FAIL: not in test mode\r\n");
+				}
+				else if (rx[3] > 0x02)
+				{
+					printf("BIAS GROUP FAIL: data=0x%02X, use 0x00(A)/0x01(B)/0x02(A2)\r\n", rx[3]);
+				}
+				else if (LHE7909_bias_capture_busy())
+				{
+					printf("BIAS GROUP BUSY: capture running, wait for #END\r\n");
+				}
+				else
+				{
+					LHE7909_bias_switch_group(rx[3]);
+				}
+				return 1;
+
+			case ECG_CMD_BIAS_ACQ:            /* 触发一次定长采集(2000 点) */
+				if (!g_bias_test_active)
+				{
+					printf("BIAS ACQ FAIL: not in test mode\r\n");
+				}
+				else
+				{
+					LHE7909_bias_acq_start();
+				}
+				return 1;
+
+			case ECG_CMD_BIAS_EXIT:           /* 退出测试模式，恢复初始化配置 */
+				if (!g_bias_test_active)
+				{
+					printf("BIAS EXIT: not in test mode\r\n");
+				}
+				else
+				{
+					LHE7909_bias_exit();
+				}
+				return 1;
+
+			default:
+				/* 二进制模式命令(SET_DR/PAUSE/READ_CFG/WRITE_REG)的实现在文本模式下
+				 * 本就编译为空，未知命令不动作，仅提示 */
+				printf("BIAS CMD unknown: 0x%02X\r\n", rx[2]);
+				return 0;
+		}
+	}
+#endif
 }
 
 

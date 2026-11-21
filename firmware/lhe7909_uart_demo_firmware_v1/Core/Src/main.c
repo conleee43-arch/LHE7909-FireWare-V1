@@ -115,10 +115,17 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-#if ECG_UART_BIN_MODE
-		 /* 处理上位机串口命令（如采样率切换）；文本调试模式下关掉，
-		  * 避免主循环的阻塞接收与中断里的 printf 抢占同一个 UART 句柄。 */
+		 /* 处理上位机串口命令（主循环轮询）：
+		  * 二进制模式(ECG_UART_BIN_MODE=1)：采样率/暂停/读配置/写寄存器，原有行为不变；
+		  * 文本调试模式(ECG_UART_BIN_MODE=0)：BIAS_AMP 闭环 A/B/A′ 对比测试命令
+		  * (ENTER/GROUP/ACQ/EXIT)。文本模式的接收直读 USART2 RXNE/RDR，不持 HAL
+		  * 全局锁，与 DRDY 中断内的 printf 阻塞发送互不抢占，
+		  * 见 LHE7909_process_command() 文本模式分支。 */
 		 LHE7909_process_command();
+
+#if (ECG_UART_BIN_MODE == 0)
+		 /* BIAS 测试任务：采集完成(或采集中断停滞超时)后输出定长采集 CSV */
+		 LHE7909_bias_task();
 #endif
 
 		 /* 运行指示灯：只有正在上传数据时才闪烁（见 LHE7909_led_task） */

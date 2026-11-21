@@ -23,6 +23,11 @@
 #define CH8SET_ADDRESS                     0x0C
 #define RLD_SENSP_ADDRESS                  0x0D
 #define RLD_SENSN_ADDRESS                  0x0E
+/* 0x0D/0x0E 在本芯片同时是偏置求和选择寄存器 BIAS_SENSP/BIAS_SENSN（历史命名 RLD_SENSP/N
+ * 与其为同一地址）。BIAS_AMP 闭环测试按 BIAS_SENSP/N 语义使用：bit0=1 将 IN1P/IN1N
+ * 接入偏置求和网络。 */
+#define BIAS_SENSP_ADDRESS                 RLD_SENSP_ADDRESS
+#define BIAS_SENSN_ADDRESS                 RLD_SENSN_ADDRESS
 #define LOFF_SENSP_ADDRESS                 0x0F
 #define LOFF_SENSN_ADDRESS                 0x10
 #define LOFF_FLIP_ADDRESS                  0x11
@@ -214,6 +219,31 @@
 #define ECG_CMD_READ_CFG                     0x03   /* data=0:读取寄存器配置 */
 #define ECG_CMD_WRITE_REG                    0x04   /* 写寄存器(7B帧): [AA][CC][04][addr][val][sum][0D] */
 
+/* BIAS_AMP 闭环 A/B/A′ 对比测试命令（帧格式同上，仅文本调试模式 ECG_UART_BIN_MODE=0 下解析）。
+ * 分组定义：A 组 CONFIG3=0x98(PD_BIAS 掉电) / B 组 0x9C(PD_BIAS 使能) / A′ 组 0x98(切回复测)。
+ * 命令行为详见 LHE7909.c 的 BIAS 测试模块注释。 */
+#define ECG_CMD_BIAS_ENTER                   0x10   /* data=0x00: 进入测试模式: 写公共配置(逐个回读校验)+切A组+2s稳定+配置转储 */
+#define ECG_CMD_BIAS_GROUP                   0x11   /* data=0x00:切A组 0x01:切B组 0x02:切回A组(A′) — SDATAC→写CONFIG3→回读校验→START→丢弃2s数据 */
+#define ECG_CMD_BIAS_ACQ                     0x12   /* data=0x00: 触发一次定长采集(2000点CH1+CH8原始码)，采满后主循环输出CSV */
+#define ECG_CMD_BIAS_EXIT                    0x13   /* data=0x00: 退出测试模式，恢复进入前的初始化配置 */
+
+/* ========== BIAS_AMP 闭环 A/B/A′ 对比测试公共配置 ========== */
+/* 唯一变量是 CONFIG3 的 PD_BIAS(bit2)：A/A′=0x98 掉电、B=0x9C 使能；其余寄存器固定 */
+#define BIAS_TEST_CFG1                       0x55   /* 500SPS */
+#define BIAS_TEST_CFG2                       0xD3   /* 内部测试信号源(与上电初始化一致) */
+#define BIAS_TEST_CFG3_A                     0x98   /* PD_REFBUF=1,BIAS_MEAS=1,BIASREF_INT=1,PD_BIAS=0(掉电) */
+#define BIAS_TEST_CFG3_B                     0x9C   /* 同上,PD_BIAS=1(BIAS_AMP 使能) */
+#define BIAS_TEST_LOFF                       0x03
+#define BIAS_TEST_CH1SET                     0x60   /* CH1 增益12、正常电极输入(MUX=000) */
+#define BIAS_TEST_CH1_GAIN                   12     /* 与 BIAS_TEST_CH1SET 高 4 位一致，进测试模式时同步给 ch1_gain */
+#define BIAS_TEST_CH8SET                     0x12   /* CH8 增益1、偏置回读(MUX=010) */
+#define BIAS_TEST_BIASSENSP                  0x01   /* IN1P 接入偏置求和 */
+#define BIAS_TEST_BIASSENSN                  0x01   /* IN1N 接入偏置求和 */
+#define BIAS_TEST_N_POINTS                   2000   /* 每组采集点数(500SPS 下 4 秒) */
+#define BIAS_TEST_SETTLE_MS                  2000   /* 切组后丢弃数据的稳定等待(环路+数字滤波器) */
+#define BIAS_TEST_FS_SPS                     500    /* 采样率(CSV 头 FS= 字段) */
+#define BIAS_TEST_STALL_MS                   1000   /* 采集中断超过该时长无新样本→按实际点数结束并告警 */
+
 /* 配置响应帧: [0xAA][0xDD][count][reg val]...[sum]（帧头2=0xDD，区分数据帧0x55/确认帧0xDB） */
 #define ECG_CFG_HEAD2                        0xDD
 
@@ -301,8 +331,16 @@ uint8_t LHE7909_set_dr(uint8_t dr);
  * 停止上传超过 LED_UPLOAD_ALIVE_MS 后熄灭。由 main 主循环周期调用。 */
 void LHE7909_led_task(void);
 
-/* 解析上位机命令帧（在 main 主循环轮询），返回是否处理了命令 */
+/* 解析上位机命令帧（在 main 主循环轮询），返回是否处理了命令。
+ * 二进制模式(ECG_UART_BIN_MODE=1)：采样率/暂停/读配置/写寄存器命令；
+ * 文本调试模式(ECG_UART_BIN_MODE=0)：BIAS_AMP 闭环 A/B/A′ 对比测试命令
+ * (ENTER/GROUP/ACQ/EXIT，见 ECG_CMD_BIAS_*)。 */
 uint8_t LHE7909_process_command(void);
+
+/* BIAS 测试任务：主循环周期调用（仅文本调试模式有效）。采集完成(或采集中断
+ * 停滞超时)后输出定长采集 CSV：起始行 #GROUP,<A|B|A2>,CONFIG3=0x98|0x9C,N=2000,
+ * FS=500,GAIN=12；数据行 序号,CH1原始码,CH1电压mV,CH8原始码；结束行 #END,<实际点数>。 */
+void LHE7909_bias_task(void);
 
 
 
