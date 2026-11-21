@@ -198,7 +198,7 @@
 #define ECG_FRAME_CH_BYTES                   4
 
 /* 1: 二进制帧输出(上位机模式)  0: printf CSV 调试输出 */
-#define ECG_UART_BIN_MODE                    1
+#define ECG_UART_BIN_MODE                    0
 
 /* ========== 上位机控制命令协议（下行） ========== */
 /* PC->MCU: [0xAA][0xCC][cmd][data][sum]{0x0D}  共 6B */

@@ -16,6 +16,24 @@ uint8_t counter;
 float VrefVolt;
 
 uint8_t ch1_gain,ch2_gain,ch3_gain,ch4_gain,ch5_gain,ch6_gain,ch7_gain,ch8_gain;
+
+/* 回读校验：写后立即读回并与期望值比对，只报告、不改变流程。
+ * 用于 WCT1/WCT2/LOFF 这类“写入值是否被硅片保持”需要实测确认的寄存器。 */
+static uint8_t LHE7909_check_reg(uint8_t address, uint8_t expect, const char *name)
+{
+	uint8_t value = LHE7909_read_register(address);
+
+	if (value == expect)
+	{
+		printf("%s: 0x%x OK\r\n", name, value);
+	}
+	else
+	{
+		printf("%s: 0x%x (expect 0x%x) MISMATCH\r\n", name, value, expect);
+	}
+	return value;
+}
+
 void LHE7909_init(uint8_t DR)
 {
 	uint8_t x1=0;
@@ -29,76 +47,98 @@ void LHE7909_init(uint8_t DR)
 		HAL_GPIO_WritePin(GPIOB, LHE7909_START_Pin, GPIO_PIN_RESET);
 
      
-	  HAL_Delay(35);//上电等待至少35ms
-	
-    LHE7909_RESET();//先发RESET命令
+	/* 上电等待 tPOR：手册给 32~100ms，取上限 ≥100ms，同时覆盖 VCAP1 充到
+	 * 1.1V 的时间（VCAP1 用 100µF 时更久），宁长勿短。 */
+	HAL_Delay(100);
 
+	LHE7909_RESET();//先发RESET命令
+	/* 复位后至少等 18 tCLK（2.048MHz 下约 8.8µs）再发任何命令，这里给 20µs */
+	LHE7909_delay_us(20);
 
-    LHE7909_SDATAC();
+	LHE7909_SDATAC();
 		
-	 DUT_WTREG(0xac,0x01,0x82);//USERKEY UNLOCK;
+	DUT_WTREG(0xac,0x01,0x82);//USERKEY UNLOCK;
 
-	x1=LHE7909_read_register(ID_ADDRESS);
-	printf("ID_ADDRESS: %x\r\n",x1);
-	x1 =0xe0;
+	/* ID 校验：DEV_ID[7:5] 必须为 101b。bit4 手册两节不一致（8 通道可能回读
+	 * A0h 或 B0h），故只校验高 3 位；不符时报警并停止配置，不带病继续。 */
+	x1 = LHE7909_read_register(ID_ADDRESS);
+	printf("ID_ADDRESS: %x\r\n", x1);
+	if ((x1 & 0xE0) != 0xA0)
+	{
+		printf("ID check FAIL: DEV_ID[7:5]=%d, expect 5(101b)\r\n", x1 >> 5);
+		return;
+	}
+	printf("ID check OK\r\n");
 
-   counter=0;
+	counter=0;
 
-	LHE7909_write_register(CONFIG1_ADDRESS,0xc6);//HR模式;500SPS
+	/* 手册无 HR 位（bit7 保留恒 0、bit4 只读恒 1）；DR[2:0]=101 才是 500 SPS。
+	 * bit6=1 保持多重回读模式。实测写 C6h 会读回 56h（DR=110，即 250 SPS），不能沿用。 */
+	LHE7909_write_register(CONFIG1_ADDRESS,0x55);
 	x1=LHE7909_read_register(CONFIG1_ADDRESS);
 	printf("CONFIG1_ADDRESS: %x\r\n",x1);
 
 	
-	LHE7909_write_register(CONFIG2_ADDRESS,0xC0);//defalut 
+	/* 内部测试信号源：INT_TEST=1、CAL_FREQ=11（直流）、CAL_AMP=0（1 倍），bit7:6=11。
+	 * 测试信号幅度 = (VREFP-VREFN)/1000 ≈ 2.4mV（输入端起，再乘 PGA 增益送 ADC）。 */
+	LHE7909_write_register(CONFIG2_ADDRESS,0xD3);
 	x1=LHE7909_read_register(CONFIG2_ADDRESS);
 	printf("CONFIG2_ADDRESS: %x\r\n",x1);
  
  
  
- LHE7909_write_register(CONFIG3_ADDRESS,0x8C);//参考电压为内部2.4V；使能RLD buffer；不使能大电流模式
-	x1=LHE7909_read_register(CONFIG3_ADDRESS);
-	printf("CONFIG3_ADDRESS: %x\r\n",x1);	
+ /* 0x9C：闭环测试 BIAS_AMP 负反馈与偏置回读：
+	 * PD_REFBUF=1(bit7, 2.4V内部基准缓冲开)、ILEAD_EN=0(bit6)、VREF_4V=0(bit5)、
+	 * BIAS_MEAS=1(bit4, 开启偏置回读)、BIASREF_INT=1(bit3, 内部(AVDD+AVSS)/2中点)、
+	 * PD_BIAS=1(bit2, BIAS_AMP使能)。 */
+ LHE7909_write_register(CONFIG3_ADDRESS,0x9C);
+	LHE7909_check_reg(CONFIG3_ADDRESS, 0x9C, "CONFIG3_ADDRESS");
 	VrefVolt=2400.0;//参考电压为2400mV
+
+	/* 内部基准建立时间约 150ms（电气特性表）：写完 CONFIG3 使能基准缓冲后，
+	 * 先等够再写其余寄存器、更不要采数。改用外部基准时可删掉本次等待。 */
+	HAL_Delay(150);
 	
-  LHE7909_write_register(LOFF_ADDRESS,0x13);//导联脱落比较器阈值VTHH=70%,VTHL=30%;导联脱落检测模式为直流，电阻模式									
-	x1=LHE7909_read_register(LOFF_ADDRESS);
-	printf("LOFF_ADDRESS: %x\r\n",x1);
+  /* 导联脱落检测已整体关闭（CONFIG4 比较器关、LOFF_SENSP/N 全 0），这里只清掉
+	 * bit4 保留位、不使能激励电流。实测写 13h 会读回 03h（bit4 只读 0），故直接写 03h。 */
+  LHE7909_write_register(LOFF_ADDRESS,0x03);
+	LHE7909_check_reg(LOFF_ADDRESS, 0x03, "LOFF_ADDRESS");
 	
    //============CHnSET Begin==============================================
-   LHE7909_write_register(CH1SET_ADDRESS,0X00);//0x00 G=6 
-   x1=LHE7909_read_register(CH1SET_ADDRESS);
-   printf("CH1SET_ADDRESS: %x\r\n",x1);
-   LHE7909_write_register(CH2SET_ADDRESS,0X00);
-   LHE7909_write_register(CH3SET_ADDRESS,0X00);
-   LHE7909_write_register(CH4SET_ADDRESS,0X00);
-   LHE7909_write_register(CH5SET_ADDRESS,0X00);
-   LHE7909_write_register(CH6SET_ADDRESS,0X00);
-   LHE7909_write_register(CH7SET_ADDRESS,0X00);
-   LHE7909_write_register(CH8SET_ADDRESS,0X00);
-	 ch1_gain=6;
+   /* 偏置闭环与回读测试：CH1 设为 Gain=1、正常电极输入(MUX=000，编码 0x10)；
+	 * CH2~CH7 保持 Gain=6、内部短接(0x01)；CH8 设为 Gain=1、偏置测量模式(MUX=010，编码 0x12)。 */
+   LHE7909_write_register(CH1SET_ADDRESS,0x10);
+   LHE7909_check_reg(CH1SET_ADDRESS, 0x10, "CH1SET_ADDRESS");
+   LHE7909_write_register(CH2SET_ADDRESS,0X01);
+   LHE7909_write_register(CH3SET_ADDRESS,0X01);
+   LHE7909_write_register(CH4SET_ADDRESS,0X01);
+   LHE7909_write_register(CH5SET_ADDRESS,0X01);
+   LHE7909_write_register(CH6SET_ADDRESS,0X01);
+   LHE7909_write_register(CH7SET_ADDRESS,0X01);
+   LHE7909_write_register(CH8SET_ADDRESS,0x12);
+   LHE7909_check_reg(CH8SET_ADDRESS, 0x12, "CH8SET_ADDRESS");
+	 ch1_gain=1;
 	 ch2_gain=6;
 	 ch3_gain=6;
 	 ch4_gain=6;
 	 ch5_gain=6;
 	 ch6_gain=6;
 	 ch7_gain=6;
-	 ch8_gain=6;
+	 ch8_gain=1;
 	
-	LHE7909_write_register(RLD_SENSP_ADDRESS,0x06);//0X06 IN3P IN2P----LL LA
-	x1=LHE7909_read_register(RLD_SENSP_ADDRESS);
-	printf("RLD_SENSP_ADDRESS: %x\r\n",x1);
+	LHE7909_write_register(RLD_SENSP_ADDRESS,0x01);//BIAS_SENSP=0x01，仅将 CH1 P 端接入偏置环路（CH8 不参与计算）
+	LHE7909_check_reg(RLD_SENSP_ADDRESS, 0x01, "RLD_SENSP_ADDRESS");
 	
-	LHE7909_write_register(RLD_SENSN_ADDRESS,0x06);//0X06 IN3N IN2N----RA  RA
-	x1=LHE7909_read_register(RLD_SENSN_ADDRESS);
-	printf("RLD_SENSN_ADDRESS: %x\r\n",x1);
+	LHE7909_write_register(RLD_SENSN_ADDRESS,0x01);//BIAS_SENSN=0x01，仅将 CH1 N 端接入偏置环路（CH8 不参与计算）
+	LHE7909_check_reg(RLD_SENSN_ADDRESS, 0x01, "RLD_SENSN_ADDRESS");
 
 
-	LHE7909_write_register(LOFF_SENSP_ADDRESS,0xff);//启用IN1P~IN8P导联脱落
+	LHE7909_write_register(LOFF_SENSP_ADDRESS,0x00);//关闭 IN1P~IN8P 导联脱落检测（未启用激励电流）
 	x1=LHE7909_read_register(LOFF_SENSP_ADDRESS);
 	printf("LOFF_SENSP_ADDRESS: %x\r\n",x1);
 
 
-	LHE7909_write_register(LOFF_SENSN_ADDRESS,0xff);//启用IN1N~IN8N导联脱落
+	LHE7909_write_register(LOFF_SENSN_ADDRESS,0x00);//关闭 IN1N~IN8N 导联脱落检测（未启用激励电流）
 	x1=LHE7909_read_register(LOFF_SENSN_ADDRESS);
 	printf("LOFF_SENSN_ADDRESS: %x\r\n",x1);
 
@@ -120,21 +160,15 @@ void LHE7909_init(uint8_t DR)
 	printf("PACE_ADDRESS: %x\r\n",x1);
 	
 	
-	LHE7909_write_register(CONFIG4_ADDRESS,0x03);//连续模式,启用导联脱落比较器，开启SINC4
+	LHE7909_write_register(CONFIG4_ADDRESS,0x01);//连续转换；导联脱落比较器关闭；bit0 固定写 1
 	x1=LHE7909_read_register(CONFIG4_ADDRESS);
 	printf("CONFIG4_ADDRESS: %x\r\n",x1);
 
 
 
-	LHE7909_write_register(WCT1_ADDRESS,0x0B);//WCT1使能，RA电极(IN2N)连接到WCTA
-	x1=LHE7909_read_register(WCT1_ADDRESS);
-	printf("WCT1_ADDRESS: %x\r\n",x1);	
-	
-	LHE7909_write_register(WCT2_ADDRESS,0xD4);//使能WCTB,WCTC  IN3P---WCTC LL电极;IN2P---WCTB   LA电极
-	x1=LHE7909_read_register(WCT2_ADDRESS);
-	printf("WCT2_ADDRESS: %x\r\n",x1);	
+	/* WCT1/WCT2(18h/19h)：手册未定义这两个地址，实测写入也不保持
+	 * （0Bh→03h、D4h→14h），故不再配置 WCT，胸导不使用 WCT 作为参考。 */
 
-		
 		
 	x1=DUT_RTREG(LOFF_CFG_HIGH_ADDR,LOFF_CFG_LOW_ADDR);
 	printf("LOFF_CFG_ADDRESS: %x\r\n",x1);
@@ -330,13 +364,41 @@ void LHE7909_STOP(void)
 
 
 
+/* 微秒级延时：用 DWT 周期计数器实现，替代原来靠 __NOP 空循环“凑”的写法，
+ * 保证 18 tCLK 复位等待、tSDECODE 字节间隔等最小时间有真实裕量。
+ * CYCCNT 随 CPU 时钟递增，cycles_per_us 由 HAL_RCC_GetSysClockFreq() 换算。 */
 void LHE7909_delay_us(uint32_t time)
 {
-	volatile uint32_t i;
-  for(i=0;i<10*time;i++)
+	static uint32_t cycles_per_us = 0;
+	uint32_t start;
+
+	if (cycles_per_us == 0U)
 	{
-		__NOP();
+		CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+		DWT->CYCCNT = 0U;
+		DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+		cycles_per_us = HAL_RCC_GetSysClockFreq() / 1000000U;
+		if (cycles_per_us == 0U)
+		{
+			cycles_per_us = 1U;
+		}
 	}
+
+	start = DWT->CYCCNT;
+	while ((DWT->CYCCNT - start) < (time * cycles_per_us))
+	{
+	}
+}
+
+/* 标准 24 位二进制补码符号扩展为 32 位有符号整数（无符号拼接避免有符号左移 UB，不减 0x800000） */
+static int32_t LHE7909_sign_extend_24bit(uint8_t b2, uint8_t b1, uint8_t b0)
+{
+	uint32_t raw = ((uint32_t)b2 << 16) | ((uint32_t)b1 << 8) | (uint32_t)b0;
+	if ((raw & 0x00800000U) != 0U)
+	{
+		raw |= 0xFF000000U;
+	}
+	return (int32_t)raw;
 }
 
 extern uint8_t LHE7909_adc_data[27];
@@ -359,38 +421,14 @@ void LHE7909_get_adc_data(void)
     if((LHE7909_adc_data[0]&0xC0)==0xC0)
 		{
 		       #if 1//打印ECG通道数据
-				ch1_hex = (int32_t)(((((LHE7909_adc_data[3] & 0x80) ? (0xFF) :(0x00)) ) << 24) |
-				                                            ((LHE7909_adc_data[3]&0xFF)<<16)|
-				                                            ((LHE7909_adc_data[4]&0xFF)<<8)|
-				                                            ((LHE7909_adc_data[5]&0xFF)<<0));
-				ch2_hex = (int32_t)(((((LHE7909_adc_data[6] & 0x80) ? (0xFF) :(0x00)) ) << 24) |
-				                                            ((LHE7909_adc_data[6]&0xFF)<<16)|
-				                                            ((LHE7909_adc_data[7]&0xFF)<<8)|
-				                                            ((LHE7909_adc_data[8]&0xFF)<<0));						
-				ch3_hex = (int32_t)(((((LHE7909_adc_data[9] & 0x80) ? (0xFF) :(0x00)) ) << 24) |
-				                                            ((LHE7909_adc_data[9]&0xFF)<<16)|
-				                                            ((LHE7909_adc_data[10]&0xFF)<<8)|
-				                                            ((LHE7909_adc_data[11]&0xFF)<<0));	
-			 ch4_hex = (int32_t)(((((LHE7909_adc_data[12] & 0x80) ? (0xFF) :(0x00)) ) << 24) |
-				                                            ((LHE7909_adc_data[12]&0xFF)<<16)|
-				                                            ((LHE7909_adc_data[13]&0xFF)<<8)|
-				                                            ((LHE7909_adc_data[14]&0xFF)<<0));	
-			 ch5_hex = (int32_t)(((((LHE7909_adc_data[15] & 0x80) ? (0xFF) :(0x00)) ) << 24) |
-				                                            ((LHE7909_adc_data[15]&0xFF)<<16)|
-				                                            ((LHE7909_adc_data[16]&0xFF)<<8)|
-				                                            ((LHE7909_adc_data[17]&0xFF)<<0));	
-				ch6_hex = (int32_t)(((((LHE7909_adc_data[18] & 0x80) ? (0xFF) :(0x00)) ) << 24) |
-				                                            ((LHE7909_adc_data[18]&0xFF)<<16)|
-				                                            ((LHE7909_adc_data[19]&0xFF)<<8)|
-				                                            ((LHE7909_adc_data[20]&0xFF)<<0));	
-				ch7_hex = (int32_t)(((((LHE7909_adc_data[21] & 0x80) ? (0xFF) :(0x00)) ) << 24) |
-				                                            ((LHE7909_adc_data[21]&0xFF)<<16)|
-				                                            ((LHE7909_adc_data[22]&0xFF)<<8)|
-				                                            ((LHE7909_adc_data[23]&0xFF)<<0));	
-				ch8_hex = (int32_t)(((((LHE7909_adc_data[24] & 0x80) ? (0xFF) :(0x00)) ) << 24) |
-				                                            ((LHE7909_adc_data[24]&0xFF)<<16)|
-				                                            ((LHE7909_adc_data[25]&0xFF)<<8)|
-				                                            ((LHE7909_adc_data[26]&0xFF)<<0));
+				ch1_hex = LHE7909_sign_extend_24bit(LHE7909_adc_data[3],  LHE7909_adc_data[4],  LHE7909_adc_data[5]);
+				ch2_hex = LHE7909_sign_extend_24bit(LHE7909_adc_data[6],  LHE7909_adc_data[7],  LHE7909_adc_data[8]);
+				ch3_hex = LHE7909_sign_extend_24bit(LHE7909_adc_data[9],  LHE7909_adc_data[10], LHE7909_adc_data[11]);
+				ch4_hex = LHE7909_sign_extend_24bit(LHE7909_adc_data[12], LHE7909_adc_data[13], LHE7909_adc_data[14]);
+				ch5_hex = LHE7909_sign_extend_24bit(LHE7909_adc_data[15], LHE7909_adc_data[16], LHE7909_adc_data[17]);
+				ch6_hex = LHE7909_sign_extend_24bit(LHE7909_adc_data[18], LHE7909_adc_data[19], LHE7909_adc_data[20]);
+				ch7_hex = LHE7909_sign_extend_24bit(LHE7909_adc_data[21], LHE7909_adc_data[22], LHE7909_adc_data[23]);
+				ch8_hex = LHE7909_sign_extend_24bit(LHE7909_adc_data[24], LHE7909_adc_data[25], LHE7909_adc_data[26]);
 				ch1_voltage =ADC_DataToMiniVolt(ch1_hex,ch1_gain);
 				ch2_voltage =ADC_DataToMiniVolt(ch2_hex,ch2_gain);
 				ch3_voltage =ADC_DataToMiniVolt(ch3_hex,ch3_gain);
@@ -404,7 +442,16 @@ void LHE7909_get_adc_data(void)
 			/* 状态字前 3 字节(原始 hex)紧随数据帧上传，上位机解析导联脱落状态 */
 			LHE7909_send_loff_status();
 #else
-		 printf("%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\r\n",ch2_voltage,ch3_voltage,ch4_voltage,ch5_voltage,ch6_voltage,ch7_voltage,ch8_voltage,ch1_voltage);
+		 /* 调试输出：CH1~CH8 按顺序输出电压(mV，未除 PGA 增益)及 24 位原始采集码(0xXXXXXX) */
+		 printf("CH1:%.3f(0x%06lX),CH2:%.3f(0x%06lX),CH3:%.3f(0x%06lX),CH4:%.3f(0x%06lX),CH5:%.3f(0x%06lX),CH6:%.3f(0x%06lX),CH7:%.3f(0x%06lX),CH8:%.3f(0x%06lX)\r\n",
+		        ch1_voltage, (unsigned long)((uint32_t)ch1_hex & 0x00FFFFFFUL),
+		        ch2_voltage, (unsigned long)((uint32_t)ch2_hex & 0x00FFFFFFUL),
+		        ch3_voltage, (unsigned long)((uint32_t)ch3_hex & 0x00FFFFFFUL),
+		        ch4_voltage, (unsigned long)((uint32_t)ch4_hex & 0x00FFFFFFUL),
+		        ch5_voltage, (unsigned long)((uint32_t)ch5_hex & 0x00FFFFFFUL),
+		        ch6_voltage, (unsigned long)((uint32_t)ch6_hex & 0x00FFFFFFUL),
+		        ch7_voltage, (unsigned long)((uint32_t)ch7_hex & 0x00FFFFFFUL),
+		        ch8_voltage, (unsigned long)((uint32_t)ch8_hex & 0x00FFFFFFUL));
 #endif
 		 #endif
 		// printf("%.3f\r\n",ch1_voltage);

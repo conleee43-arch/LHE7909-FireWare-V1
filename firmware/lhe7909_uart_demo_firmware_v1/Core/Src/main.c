@@ -115,8 +115,11 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-		 /* 处理上位机串口命令（如采样率切换） */
+#if ECG_UART_BIN_MODE
+		 /* 处理上位机串口命令（如采样率切换）；文本调试模式下关掉，
+		  * 避免主循环的阻塞接收与中断里的 printf 抢占同一个 UART 句柄。 */
 		 LHE7909_process_command();
+#endif
 
 		 /* 运行指示灯：只有正在上传数据时才闪烁（见 LHE7909_led_task） */
 		 LHE7909_led_task();
